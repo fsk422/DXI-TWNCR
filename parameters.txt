@@ -1,0 +1,208 @@
+================================================================================
+IXAD — Experimental Parameter Settings
+IX-WNCROD (DXI-TWNCR): Interpretable Incremental Anomaly Detection
+================================================================================
+This file lists ALL parameter settings used in the reproducible experiment set
+(experiments/*.py). It accompanies the GitHub release of the IXAD project.
+Last updated: 2026-10-15
+
+--------------------------------------------------------------------------------
+0. GENERAL / GLOBAL SETTINGS
+--------------------------------------------------------------------------------
+SEED            = 42            # universal random seed (numpy RandomState)
+NORMALIZATION   = min-max to [0, 1]       # per feature
+LABEL           = binary: y = (y >= 0.5)  # .mat last column -> {0, 1}
+N_MAX_CAP       = 6000          # upper bound on n_max (memory cap across tiers)
+MAX_EVAL        = 3000          # cap on number of stream points actually scored
+BETA (default)  = 0.67          # background proportion beta = |P1| / |U|
+LAMBDA default  = 1.0           # radius scale: delta = sigma / lambda  (=> delta = sigma)
+
+--------------------------------------------------------------------------------
+1. DATA PARTITION (unified, SEED=42)
+--------------------------------------------------------------------------------
+D      = P0 + P4                                     # full dataset
+P0     = P1 + X + P3                                 # stratified sample of D
+U      = P1 + X                                      # initialization base, fit(U)
+Stream = P3 + P4                                     # per-point / per-batch ingestion
+
+U_size  = max(50, int(P0 * alpha))                   # |U|
+x_size  = int(U_size * (1 - BETA))                   # |X|  (concept set)
+p1_size = U_size - x_size                            # |P1| (background)
+p3_size = max(20, P0 - U_size)                       # |P3|
+K_val   = max(1, int(x_size * 0.02))                 # batch size for K-variants
+n_max   = min(int(1.1 * U_size), N_MAX_CAP)          # reset threshold (|U| bound)
+
+Five-tier traffic stratification TIER_PARAMS (alpha = P0 sampling ratio, P0 cap):
+  T1 (N < 1000)          : alpha = 0.60, P0 = N (whole dataset)
+  T2 (1000-5000)         : alpha = 0.60, P0 = N
+  T3 (5000-10000)        : alpha = 0.60, P0 = 5000
+  T4 (10000-100000)      : alpha = 0.40, P0 = 8000
+  T5 (> 100000)          : alpha = 0.30, P0 = 15000
+
+--------------------------------------------------------------------------------
+2. IX-WNCROD (DXI-TWNCR) — PROPOSED ALGORITHM
+--------------------------------------------------------------------------------
+Class: src/detectors/ix_wncrod.py  (class IXWNCROD)
+Constructor parameters (defaults):
+    lammda          = 1.0     # radius scale; delta = sigma / lammda
+    n_max           = 2000    # bounded-memory threshold (experiments override)
+    drift_threshold = 4.0     # NOM z-score for drift-triggered reset
+    fast_update     = True    # True = incremental, False = full recompute
+    batch_size      = 1       # 1 = per-point, K>1 = batch
+    optimize_level  = 0       # 0=base(V3/V4) 1=opt3(V8/V9) 2=opt2+opt3(V6/V7) 3=opt2(V10/V11)
+
+Nine variants (V1-V9) controlled by fast_update x batch_size x optimize_level:
+    V1 = WNCRODBase        (separate class, batch-only, no attribution)
+    V2 = fast=False, bs=1  (per-point full recompute)
+    V3 = fast=True,  bs=1  (per-point incremental)          <-- DXI-TWNCR
+    V4 = fast=True,  bs=K  (batch incremental)
+    V5 = fast=False, bs=K  (batch full recompute)
+    V6 = V3 + opt2+opt3    (optimize_level=2, bs=1)
+    V7 = V4 + opt2+opt3    (optimize_level=2, bs=K)
+    V8 = V3 + opt3         (optimize_level=1, bs=1)
+    V9 = V4 + opt3         (optimize_level=1, bs=K)         <-- IX-WNCROD (fast)
+Core invariant: V2-V9 produce identical scores and attributions for any point.
+
+Three-region thresholds (dimension m = number of features):
+    D1 = m / 3.0      # Lower/positive boundary for NEB
+    D2 = m / 2.0      # boundary for NPB
+    D3 = 0.9 * m      # boundary for NPB/Lower
+Regions: NEB = positive region, NPB = boundary region, Lower = negative region.
+
+Score decomposition (intrinsic attribution):
+    f(x)      = sum_j phi_j
+    phi_j     = NDF_j * w_x / m
+    w_x       = 1 - sqrt( |NB_(x, delta_j)| / n_ref )
+    NDF_j     = (neb_count + lower_count + npb_count) / n_ref
+  => attribute-level contribution phi_j AND region-level contribution
+     (NEB / NPB / Lower) are both available; completeness = f(x) - f(x_base).
+
+--------------------------------------------------------------------------------
+3. CORE INCREMENTAL VARIANT BENCHMARK (experiments/incr_core.py)
+--------------------------------------------------------------------------------
+Four variants, same data split (SEED=42), 14 datasets:
+    Rebuild1  : per-point full recompute + Phase-C reset
+    RebuildK  : batch full recompute     + Phase-C reset
+    Incr1     : per-point incremental    + Phase-C reset   (DXI-TWNCR)
+    IncrK     : batch incremental        + Phase-C reset   (IX-WNCROD, K_val batch)
+
+Phase-C reset (forgetting): when |U| > n_max, evict earliest-added objects,
+    re-push U back to U0 size, drop earliest-added X objects to P1 and remove
+    earliest-added P1 objects. delta is frozen after the first cycle (frozen_delta).
+
+--------------------------------------------------------------------------------
+4. BASELINE ALGORITHMS (experiments/baselines.py)
+--------------------------------------------------------------------------------
+10 baselines, same data split as incr_core.py. Static fit(U) then per-point predict.
+
+  IncLOF      IncrementalLOFFixed (standard LOF, fixed impl)
+              window_size=128, n_neighbors=10, contamination=0.1
+  HST         HalfSpaceTreesFixed (mass-profile scoring, fixed impl)
+              n_trees=25, max_depth=10, window_size=128
+  RRCF        RRCFWrapper
+              n_trees=20, shingle_size=4 (default)
+  xStream     XStreamDetector
+              n_components=50, n_hash_fns=10
+  LODA        LODAIncremental
+              n_random_cuts=100, n_bins=10
+  EILOF       EILOFDetector
+              window_size=256, n_neighbors=20
+  SiForest    SiForestDetector (static evaluation: fit only, NO partial_fit)
+              n_trees=50, sample_size=128, window_size=1024, max_depth=None,
+              regrow_interval=100
+  HBOS        HBOSIncremental
+              n_bins=10 (default)
+  ECOD        ECODIncremental
+              contamination=0.1 (default)
+  BWOAIF+DIFFI BWOAIFDIFFI
+              n_trees=100, sample_size=256, window_size=512, max_depth=None
+
+Note: IncLOF / HST resolve to the *_fixed implementations in this repo
+(src/detectors/baselines/__init__.py aliases them), fixing the original
+ratio-score / constant-score defects. SiForest is evaluated statically
+(fit then predict) to avoid its streaming reservoir index defect.
+
+--------------------------------------------------------------------------------
+5. ABLATION & SENSITIVITY GRIDS
+--------------------------------------------------------------------------------
+beta ablation (background proportion)  — experiments/ablation_beta.py
+    grid    : {0.20, 0.25, ..., 0.80}   (13 levels, step 0.05)
+    datasets: creditA(T1), mushroom_01(T2), annthyroid(T3), adult_01(T4)
+    fixed   : lambda=1.0, K=1, p1x_sep=True, n_max=min(1.1*U0, 6000); Incr1 only
+
+gamma ablation (forgetting strength)   — experiments/ablation_gamma.py
+    grid    : {0.05, 0.10, 0.15, 0.20, 0.25, 0.30}   (6 levels, step 0.05)
+    n_max   : int((1 + gamma) * U0)
+    datasets: thyroid(T2, U0=2263), shuttle(T4, U0=3200)
+    scenarios: L0 (no drift), L3 (strong drift); Incr1 only; gamma=0.10 reused
+
+lambda ablation (radius scale)        — experiments/ablation_lambda.py RQ5b
+                                          + ablation_lambda_supplement.py
+    grid    : {0.5, 1.0, 1.5, 2.0, 2.5, 3.0}   (6 levels, step 0.5)
+    datasets: creditA, mushroom_01, annthyroid, adult_01
+
+
+
+K ablation (batch size)               — experiments/ablation_lambda.py RQ5c
+    grid    : {1, 5, 10, 20, 50}
+    datasets: creditA, mushroom_01, annthyroid, adult_01
+
+P1/X separation ablation              — experiments/ablation_lambda.py RQ5a
+    levels  : with vs. without P1/X separation (p1x_sep)
+    datasets: creditA, mushroom_01, annthyroid, adult_01
+
+--------------------------------------------------------------------------------
+6. CONCEPT DRIFT EXPERIMENT (experiments/drift.py)
+--------------------------------------------------------------------------------
+Drift levels (sigma = noise std, shift = mean shift on first d//2 features):
+    L0 = (0.0, 0.0), L1 = (0.2, 0.3), L2 = (0.5, 0.8), L3 = (1.0, 1.5)
+Datasets : thyroid(T2), pageblocks(T3), shuttle(T4)
+Methods  : Static1, Incr1(+PhaseC), Incr1-NR(no PhaseC), IncrK, SiForest, BWOAIF
+Sliding-window AUC : window = 300
+n_max = min(int(1.1 * U_size), 6000); K_val = max(1, int(x_size * 0.02))
+
+--------------------------------------------------------------------------------
+7. EXPLANATION FIDELITY (experiments/fidelity.py / fidelity_full.py)
+--------------------------------------------------------------------------------
+Detectors       : ITW-NCR (proposed) vs ECOD, HBOS, LODA
+Datasets        : all 14 (fidelity_full); 14-grid (fidelity_14)
+N_REF = 1500    : number of reference (normal) points
+N_ANOM = 30     : number of anomalies for perturbation test
+Fidelity metrics: top-3 |phi| removal, random-3 removal (10 trials), column-mean imputation
+
+--------------------------------------------------------------------------------
+8. EVALUATION METRICS & STATISTICAL TESTS
+--------------------------------------------------------------------------------
+Detection accuracy : AUC-ROC (roc_auc_score), AUC-PR (average_precision_score), F1
+Update efficiency  : avg_update_ms  (per-batch partial_fit wall time)
+Detection latency  : avg_detect_ms  (per-point predict_with_attribution wall time)
+Explanation quality: completeness_gap = | f(x) - f(x_base) - sum_j phi_j |
+Storage            : n_ref_actual (bounded-memory reference count)
+
+Statistical significance (significance.py / significance_fixed.py):
+    Friedman test on AUC-PR / F1 rankings (k = 12 algorithms, N = 14 datasets)
+    chi-square approx: statistic ~ chi2 with df = k - 1 = 11
+    Nemenyi post-hoc critical difference: CD = 4.454  (alpha = 0.05, k = 12, N = 14)
+
+--------------------------------------------------------------------------------
+9. DATASETS (14 .mat files, DATASETS/{Norm,High}/)
+--------------------------------------------------------------------------------
+Tier  Dataset        Sub    File                                          d    N
+T1    creditA        Norm   Mixed_creditA_425_15_42_Norm.mat              15   425
+T1    german         Norm   Mixed_german_714_20_14_Norm.mat               20   714
+T1    vote           Norm   Categorical_vote_296_16_29_Norm.mat           16   296
+T1    heart          Norm   Mixed_heart_166_13_16_Norm.mat                13   166
+T2    thyroid        Norm   Numeric_thyroid_3772_6_93_Norm.mat             6   3772
+T2    mushroom_01    Norm   Categorical_mushroom_01_4293_22_85_Norm.mat   22   4293
+T2    cardio         Norm   Numeric_cardio_1831_21_176_Norm.mat           21   1831
+T3    pageblocks     Norm   Numeric_pageblocks_5171_10_258_Norm.mat       10   5171
+T3    pendigits      Norm   Numeric_pendigits_6870_16_156_Norm.mat        16   6870
+T3    annthyroid     Norm   Numeric_annthyroid_7200_6_534_Norm.mat         6   7200
+T4    mammography    Norm   Numeric_mammography_11183_6_260_Norm.mat       6   11183
+T4    adult_01       High   Mixed_adult_01_34357_14_343_Norm.mat          14   34357
+T4    shuttle        High   Numeric_shuttle_49097_9_3511_Norm.mat          9   49097
+T5    forestcover    High   Numeric_forestcover_286048_10_2747_Norm.mat   10   286048
+
+================================================================================
+END
+================================================================================
